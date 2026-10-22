@@ -166,6 +166,9 @@
     "uvvis": {
         "peak_target": 520,
         "peak_tolerance": 5,
+        "max_fwhm_nm": 60,
+        "min_plqy": 0.001,
+        "max_peak_distance_nm": 50,
         "max_retries": 10,
         "retry_delay": 2.0,
         "fit_settings": {
