@@ -1,4 +1,3 @@
-# nsls2-template
+# BLOP-Playbooks
 
-This is a minimal template for new NSLS-II repositories.  It contains the approved BSD-3-Clause license together with additional text that should be included (LICENSE_README).  This text can appear at the bottom of the README.md if so desired. 
-
+This repo contains jupyter notebooks, jsons, and example data for beamline runs at NSLS-II XPD. It is meant to run with "tj-barrett/xpd-tools blop-agent" or "nsls2/xpd-tools autonmous"
