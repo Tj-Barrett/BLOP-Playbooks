@@ -1,0 +1,258 @@
+{
+    "connection": {
+        "queue_server": false,
+        "http_server_uri": "https://xf28id2-xpd-qs1.nsls2.bnl.gov",
+        "zmq_consumer_address": "ipc:///var/lib/bluesky-zmq-proxy/xpd-ipc-in-ipc-out/out.sock",
+        "tiled_profile": "xpd",
+        "tiled_uri": null,
+        "sandbox_uri": "https://tiled.nsls2.bnl.gov"
+    },
+    "evaluation_method": "uvvis",
+    "pdf_mode": "raw",
+    "agent_data_path": "data/halide_data_uvvis_only.csv",
+    "checkpoint_path": null,
+    "metadata": {
+        "beamline": "28id2",
+        "tags": [
+            "qserver",
+            "bluesky"
+        ],
+        "comment": "Halide Synthesis Test"
+    },
+    "success_criteria": null,
+    "pumps": [
+        {
+            "name": "CsPb",
+            "id": "dds2_p1",
+            "bounds": [
+                10,
+                250
+            ],
+            "parameter_type": "float"
+        },
+        {
+            "name": "Br",
+            "id": "dds2_p2",
+            "bounds": [
+                0,
+                250
+            ],
+            "parameter_type": "float"
+        },
+        {
+            "name": "Cl",
+            "id": "dds3_p1",
+            "bounds": [
+                0,
+                250
+            ],
+            "parameter_type": "float"
+        },
+        {
+            "name": "I",
+            "id": "dds3_p2",
+            "bounds": [
+                0,
+                250
+            ],
+            "parameter_type": "float"
+        }
+    ],
+    "experiment": {
+        "sources": [
+            {
+                "dof": "infusion_rate_CsPb",
+                "pump": "dds2_p1",
+                "precursor": "CsPb",
+                "sample_label": "Cs-rich 33mM",
+                "syringe_ml": 50.0,
+                "material": "steel",
+                "target_ml": 30.0,
+                "set_target": true,
+                "loaded_ml": 30.0,
+                "reserve_ml": 1.0
+            },
+            {
+                "dof": "infusion_rate_Br",
+                "pump": "dds2_p2",
+                "precursor": "Br",
+                "sample_label": "TOABr",
+                "syringe_ml": 50.0,
+                "material": "steel",
+                "target_ml": 30.0,
+                "set_target": true,
+                "loaded_ml": 30.0,
+                "reserve_ml": 1.0
+            },
+            {
+                "dof": "infusion_rate_Cl",
+                "pump": "dds3_p1",
+                "precursor": "Pb",
+                "sample_label": "Pb-rich 33mM",
+                "syringe_ml": 50.0,
+                "material": "steel",
+                "target_ml": 30.0,
+                "set_target": true,
+                "loaded_ml": 30.0,
+                "reserve_ml": 1.0
+            },
+            {
+                "dof": "infusion_rate_I",
+                "pump": "dds3_p2",
+                "precursor": "I",
+                "sample_label": "I",
+                "syringe_ml": 50.0,
+                "material": "steel",
+                "target_ml": 30.0,
+                "set_target": true,
+                "loaded_ml": 30.0,
+                "reserve_ml": 1.0
+            }
+        ],
+        "dilutions": [
+            {
+                "pump": "dds1_p1",
+                "ratio": 1.0,
+                "position": "before_equilibrium",
+                "syringe_ml": 20,
+                "material": "plastic_BD",
+                "target_ml": 20,
+                "set_target": true,
+                "wait_sec": 0.0,
+                "loaded_ml": 20.0,
+                "reserve_ml": 1.0
+            },
+            {
+                "pump": "ultra2",
+                "ratio": 1.0,
+                "position": "after_equilibrium",
+                "syringe_ml": 100,
+                "material": "steel",
+                "target_ml": 100,
+                "set_target": true,
+                "wait_sec": 30,
+                "loaded_ml": 100.0,
+                "reserve_ml": 1.0
+            }
+        ],
+        "wash_cycles": [
+            {
+                "pump": "ultra1",
+                "rate_ul_min": 500.0,
+                "duration_sec": 60.0,
+                "syringe_ml": 50.0,
+                "material": "steel",
+                "target_ml": 30.0,
+                "set_target": false,
+                "loaded_ml": 30.0,
+                "reserve_ml": 1.0
+            }
+        ]
+    },
+    "xray": {
+        "max_retries": null,
+        "retry_delay": null,
+        "settings": null,
+        "screening": null,
+        "quality_policy": null,
+        "objective_function": null,
+        "min_radius": null,
+        "max_radius": null,
+        "cnn_dataset_path": null,
+        "cnn_weights_path": null,
+        "fraction_mode": false,
+        "phases": null
+    },
+    "uvvis": {
+        "peak_target": 520,
+        "peak_tolerance": 5,
+        "max_retries": 10,
+        "retry_delay": 2.0,
+        "fit_settings": {
+            "pl_screen_key_height": 200,
+            "pl_screen_peak_height": 50,
+            "pl_screen_peak_distance": 100,
+            "pl_percent_range": [
+                40,
+                100
+            ],
+            "pl_wavelength_range": [
+                400,
+                800
+            ],
+            "pl_fit_maxfev": 100000,
+            "pl_fit_r2_window_sigma": 3,
+            "absorbance_percent_range": [
+                10,
+                70
+            ],
+            "absorbance_wavelength_range": [
+                210,
+                700
+            ]
+        },
+        "plqy": {
+            "reference_type": "quinine",
+            "excitation_wavelength_nm": 365,
+            "absorbance": 0.361,
+            "pl_integral": 952628,
+            "refractive_index": 1.337,
+            "plqy": 0.546,
+            "solvent_refractive_index": 1.506
+        }
+    },
+    "run": {
+        "iterations": 150,
+        "n_points": 1,
+        "extra_initialization_trials": 5,
+        "generation_strategy": {
+            "initialize_with_center": false,
+            "min_observed_initialization_trials": 2,
+            "allow_exceeding_initialization_budget": true
+        },
+        "local": {
+            "mixer_lengths_cm": [
+                0.0
+            ],
+            "residence_time_ratio": 0.0,
+            "simulated": {
+                "dof_for_phase": {
+                    "CsBr": "infusion_rate_Br",
+                    "CsPbBr3": "infusion_rate_CsPb",
+                    "CsPbI3": "infusion_rate_I",
+                    "CsPbCl3": "infusion_rate_Cl"
+                },
+                "pl_fwhm_nm": {
+                    "CsPbBr3": 20.0,
+                    "CsPbI3": 30.0,
+                    "CsPbCl3": 10.0,
+                    "CsBr": 15.0,
+                    "Cs4PbBr6": 25.0
+                },
+                "pl_alloy": [
+                    "CsPbBr3",
+                    "CsPbI3",
+                    "CsPbCl3"
+                ],
+                "band_gap_ev": {
+                    "CsPbBr3": 2.29,
+                    "CsPbI3": 1.63,
+                    "CsPbCl3": 2.9
+                },
+                "absorbance_value": {
+                    "CsPbBr3": 0.2,
+                    "CsPbI3": 0.2,
+                    "CsPbCl3": 0.2,
+                    "CsBr": 0.2,
+                    "Cs4PbBr6": 0.2
+                },
+                "peak_nm_range": [
+                    410.0,
+                    780.0
+                ],
+                "noise_level": 0.1
+            },
+            "skip_waits": true
+        }
+    }
+}
