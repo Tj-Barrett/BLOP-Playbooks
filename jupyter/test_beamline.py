@@ -1,237 +1,67 @@
 #!/usr/bin/env python
-"""Beamline smoke test for xpd-tools blop-agent (queue-server path).
+"""Beamline smoke test for NSLS2/xpd-tools @ blop-agent (queue-server path).
 
-Run at the beamline BEFORE a campaign. Each stage isolates one failure mode.
-First stage to FAIL tells you exactly what is broken.
+Targeted API (blop-agent branch ONLY):
+    xpd_tools.optimization.agent.build_queue_agent
+    xpd_tools.optimization.evaluation.XrayUvvisEvaluation
+
+The primary goal is to confirm the queue-server can register
+'xray_uvvis_acquire' and that auth/connectivity are correct before a campaign.
 
 Usage::
 
-    export XPD_HALIDE_CONFIG=/path/to/halide_beamline.json
     export XPD_HTTP_API_KEY=<queue-server key>
+    export XPD_PDF_REFERENCES=/path/pdf_references.json   # required Stage 4+
     python test_beamline.py
 
-Stages
-------
-1. Env vars present + config loads
-2. Queue-server HTTP reachable + authenticated   (401 surfaces here)
-3. Tiled read client resolves
-4. BuildAgent.from_config(...).build()           (QueueserverAgent construct)
-5. Plan 'uvvis_acquire' registered on worker
+Optional overrides (defaults from halide_local.json wiring):
+    XPD_HTTP_SERVER_URI   default: https://xf28id2-xpd-qs1.nsls2.bnl.gov
+    XPD_ZMQ_ADDRESS       default: ipc:///var/lib/bluesky-zmq-proxy/xpd-ipc-in-ipc-out/out.sock
+    TILED_PROFILE         default: xpd
+    TILED_URI             overrides TILED_PROFILE when set
+    TILED_SANDBOX_URI     default: https://tiled.nsls2.bnl.gov
+    XPD_PDF_MODE          default: fit  (or: raw)
+
+Stages (first FAIL = broken layer):
+    1. Env vars present
+    2. Queue-server status() authenticated   <- 401 surfaces HERE
+    3. Tiled raw + sandbox clients resolve
+    4. XrayUvvisEvaluation constructs        (validates pdf_references / cif)
+    5. RemoteDispatcher(zmq) constructs
+    6. build_queue_agent() constructs        <- QueueserverAgent
+    7. 'xray_uvvis_acquire' registered on worker
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import traceback
 
 # ---------------------------------------------------------------------------
+# Defaults matching halide_local.json / beamline wiring
+# ---------------------------------------------------------------------------
+
+_DEFAULT_HTTP_URI = "https://xf28id2-xpd-qs1.nsls2.bnl.gov"
+_DEFAULT_ZMQ_ADDR = "ipc:///var/lib/bluesky-zmq-proxy/xpd-ipc-in-ipc-out/out.sock"
+_DEFAULT_TILED_PROFILE = "xpd"
+_DEFAULT_SANDBOX_URI = "https://tiled.nsls2.bnl.gov"
+_SANDBOX_CATALOG = "xpd/sandbox"
+_TARGET_PLAN = "xray_uvvis_acquire"
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
-GREEN  = "\033[32m"
-RED    = "\033[31m"
-YELLOW = "\033[33m"
-RESET  = "\033[0m"
+G, R, Y, X = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
 
-def _ok(msg):   print(f"  {GREEN}[PASS]{RESET} {msg}")
-def _bad(msg):  print(f"  {RED}[FAIL]{RESET} {msg}")
-def _warn(msg): print(f"  {YELLOW}[WARN]{RESET} {msg}")
-def _info(msg): print(f"  [info] {msg}")
+def _ok(m):   print(f"  {G}[PASS]{X} {m}")
+def _bad(m):  print(f"  {R}[FAIL]{X} {m}")
+def _warn(m): print(f"  {Y}[WARN]{X} {m}")
+def _info(m): print(f"  [info] {m}")
 
-def stage(n: int, title: str) -> None:
-    print(f"\n{'='*64}\nStage {n}: {title}\n{'='*64}")
-
-
-# ---------------------------------------------------------------------------
-# Stages
-# ---------------------------------------------------------------------------
-
-def stage1_env(cfg_out: list) -> int:
-    """Check env vars, load config, validate queue_server flag."""
-    stage(1, "Environment variables + config")
-
-    config_path = os.environ.get("XPD_HALIDE_CONFIG", "")
-    http_key    = os.environ.get("XPD_HTTP_API_KEY", "")
-
-    if not config_path:
-        _bad("XPD_HALIDE_CONFIG not set — point it at the beamline config JSON")
-        return 1
-    _ok(f"XPD_HALIDE_CONFIG = {config_path}")
-
-    if not os.path.exists(config_path):
-        _bad(f"config file not found: {config_path}")
-        return 1
-    _ok("config file exists")
-
-    cfg = json.load(open(config_path))
-    cfg_out.append(cfg)
-
-    conn = cfg["connection"]
-    _info(f"queue_server    = {conn['queue_server']}")
-    _info(f"http_server_uri = {conn['http_server_uri']}")
-    _info(f"tiled_profile   = {conn['tiled_profile']}")
-    _info(f"tiled_uri       = {conn['tiled_uri']}")
-
-    if not conn["queue_server"]:
-        _bad("config has queue_server=false — this script tests the queue-server path")
-        return 1
-    _ok("queue_server=true")
-
-    if not http_key:
-        _bad(
-            "XPD_HTTP_API_KEY is empty — queue server will reject with 401.\n"
-            "       Export the key before running:\n"
-            "         export XPD_HTTP_API_KEY=<key>"
-        )
-        return 1
-    _ok(f"XPD_HTTP_API_KEY set (len={len(http_key)})")
-
-    return 0
-
-
-def stage2_qserver(conn: dict, http_key: str, api_out: list) -> int:
-    """Raw authenticated status call — surfaces 401 before full agent build."""
-    stage(2, "Queue-server HTTP: reachable + authenticated")
-
-    try:
-        from bluesky_queueserver_api.http import REManagerAPI
-
-        api = REManagerAPI(http_server_uri=conn["http_server_uri"])
-        api.set_authorization_key(api_key=http_key)
-        status = api.status()
-        api_out.append(api)
-    except Exception as exc:
-        _bad(f"queue-server status call failed: {exc}")
-        msg = str(exc).lower()
-        if "401" in msg or "unauthorized" in msg or "permission" in msg:
-            _info("→ 401: key missing, invalid, or wrong scope.")
-            _info("  Confirm with:")
-            _info(
-                f'    curl -s -H "Authorization: ApiKey $XPD_HTTP_API_KEY" '
-                f'{conn["http_server_uri"]}/api/status'
-            )
-            _info("  If curl also 401s, ask beamline staff to issue a valid key.")
-        elif "ssl" in msg or "certificate" in msg:
-            _info("→ TLS error: httpserver cert expired or self-signed.")
-            _info("  Check whether the server is on HTTP (not HTTPS) locally:")
-            _info("    http://localhost:60610 vs https://xf28id2-xpd-qs1.nsls2.bnl.gov")
-        else:
-            _info("→ Connection error: is start-re-manager + httpserver running?")
-            _info("  Start with:")
-            _info("    start-re-manager --startup-module "
-                  "xpd_tools.optimization.profiles.halide &")
-            _info("    uvicorn --host localhost --port 60610 "
-                  "bluesky_httpserver.server:app &")
-        return 1
-
-    _ok("authenticated — /status returned")
-    _info(f"manager_state          = {status.get('manager_state')}")
-    _info(f"worker_environment_up  = {status.get('worker_environment_exists')}")
-    _info(f"items_in_queue         = {status.get('items_in_queue')}")
-    _info(f"re_state               = {status.get('re_state')}")
-
-    if not status.get("worker_environment_exists"):
-        _warn(
-            "Worker environment NOT open — plan list in Stage 5 will be empty.\n"
-            "       Open it with:  api.environment_open()\n"
-            "       Or via CLI:    qserver environment open"
-        )
-
-    return 0
-
-
-def stage3_tiled(conn: dict) -> int:
-    """Tiled read client resolution — non-fatal, warns for later evaluation."""
-    stage(3, "Tiled read client resolves")
-
-    try:
-        from tiled.client import from_profile, from_uri
-
-        if conn["tiled_uri"]:
-            tc = from_uri(conn["tiled_uri"])
-        else:
-            tc = from_profile(conn["tiled_profile"])
-        _ok(f"Tiled client resolved: {type(tc).__name__}")
-
-        try:
-            keys = list(tc)[:5]
-            _info(f"top-level keys (first 5): {keys}")
-        except Exception as e:
-            _info(f"listing entries failed (non-fatal): {e}")
-
-    except Exception as exc:
-        # Non-fatal — build() doesn't need Tiled; evaluator does (later)
-        _warn(f"Tiled resolve failed (non-fatal at build time): {exc}")
-        msg = str(exc).lower()
-        if "401" in msg or "unauthorized" in msg:
-            _info("→ Tiled 401: profile has no / expired token.")
-            _info("  Check ~/.config/tiled/profiles/*.yml")
-        elif "profile" in msg:
-            _info(f"→ profile '{conn['tiled_profile']}' not in "
-                  "~/.config/tiled/profiles/")
-        _info("  Tiled reads happen at evaluation time, not build time.")
-        _info("  Build will proceed; fix Tiled auth before the first trial.")
-
-    return 0  # always continue
-
-
-def stage4_build(cfg: dict, http_key: str, run_agent_out: list) -> int:
-    """BuildAgent.from_config().build() — the QueueserverAgent constructor."""
-    stage(4, "BuildAgent.from_config(...).build()")
-
-    try:
-        from xpd_tools.optimization.agent import BuildAgent
-
-        build_agent = BuildAgent.from_config(cfg, http_api_key=http_key)
-        _ok("BuildAgent.from_config() OK")
-        _info(f"http_server_uri = {build_agent.http_server_uri}")
-        _info(f"http_api_key    = {'set' if build_agent.http_api_key else 'MISSING'}")
-        _info(f"tiled_profile   = {build_agent.tiled_profile}")
-    except Exception as exc:
-        _bad(f"from_config() failed: {exc}")
-        traceback.print_exc()
-        return 1
-
-    try:
-        run_agent = build_agent.build()
-        run_agent_out.append(run_agent)
-        _ok("build() OK — QueueserverAgent constructed")
-    except Exception as exc:
-        _bad(f"build() failed: {exc}")
-        msg = str(exc).lower()
-        if "401" in msg or "unauthorized" in msg:
-            _info("→ 401 inside build(): http_api_key not reaching REManagerAPI.")
-            _info("  Check that XPD_HTTP_API_KEY is non-empty and correct.")
-        traceback.print_exc()
-        return 1
-
-    return 0
-
-
-def stage5_plans(run_agent: object) -> int:
-    """Confirm uvvis_acquire is registered on the worker."""
-    stage(5, "Plan 'uvvis_acquire' registered on worker")
-
-    try:
-        from xpd_tools.optimization.campaign import assert_plan_registered
-
-        assert_plan_registered(run_agent, "uvvis_acquire")
-        _ok("uvvis_acquire registered and ready")
-    except RuntimeError as exc:
-        _bad(str(exc))
-        _info("Worker must start with:")
-        _info("  start-re-manager --startup-module "
-              "xpd_tools.optimization.profiles.halide")
-        _info("and XPD_HALIDE_CONFIG set in the worker environment.")
-        return 1
-    except Exception as exc:
-        _bad(f"plan check failed: {exc}")
-        traceback.print_exc()
-        return 1
-
-    return 0
+def _stage(n, t):
+    print(f"\n{'='*64}\nStage {n}: {t}\n{'='*64}")
 
 
 # ---------------------------------------------------------------------------
@@ -239,38 +69,211 @@ def stage5_plans(run_agent: object) -> int:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    print("xpd-tools beamline smoke test (queue-server path)")
-    print(f"python {sys.version.split()[0]}  |  pid {os.getpid()}")
+    print(f"xpd-tools blop-agent smoke test  |  python {sys.version.split()[0]}  |  pid {os.getpid()}")
 
-    cfg_out      = []
-    api_out      = []
-    run_agent_out = []
+    # -----------------------------------------------------------------------
+    _stage(1, "Environment variables")
+    # -----------------------------------------------------------------------
+    http_uri = os.environ.get("XPD_HTTP_SERVER_URI", _DEFAULT_HTTP_URI)
+    http_key = os.environ.get("XPD_HTTP_API_KEY", "")
+    zmq_addr = os.environ.get("XPD_ZMQ_ADDRESS", _DEFAULT_ZMQ_ADDR)
+    raw_prof = os.environ.get("TILED_PROFILE", _DEFAULT_TILED_PROFILE)
+    raw_uri  = os.environ.get("TILED_URI", "")
+    sbx_uri  = os.environ.get("TILED_SANDBOX_URI", _DEFAULT_SANDBOX_URI)
+    pdf_ref  = os.environ.get("XPD_PDF_REFERENCES", "")
+    pdf_mode = os.environ.get("XPD_PDF_MODE", "fit")
 
-    # Stage 1
-    if stage1_env(cfg_out):
+    _info(f"http_server_uri = {http_uri}")
+    _info(f"zmq_address     = {zmq_addr}")
+    _info(f"tiled           = {raw_uri or raw_prof}  |  sandbox = {sbx_uri}")
+    _info(f"pdf_references  = {pdf_ref or '(unset)'}  |  pdf_mode = {pdf_mode}")
+
+    if not http_key:
+        _bad(
+            "XPD_HTTP_API_KEY is empty — queue server will reject with 401.\n"
+            "       Export the key first:\n"
+            "         export XPD_HTTP_API_KEY=<key>"
+        )
+        return 1
+    _ok(f"XPD_HTTP_API_KEY set (len={len(http_key)})")
+
+    # -----------------------------------------------------------------------
+    _stage(2, "Queue-server status() authenticated  [401 isolates here]")
+    # -----------------------------------------------------------------------
+    try:
+        from bluesky_queueserver_api.http import REManagerAPI
+
+        api = REManagerAPI(http_server_uri=http_uri)
+        api.set_authorization_key(api_key=http_key)
+        status = api.status()
+    except Exception as exc:
+        _bad(f"status() failed: {exc}")
+        msg = str(exc).lower()
+        if "401" in msg or "unauthorized" in msg or "permission" in msg:
+            _info("-> 401: key missing, invalid, or wrong scope.")
+            _info("   Confirm with:")
+            _info(
+                f'     curl -s -H "Authorization: ApiKey $XPD_HTTP_API_KEY" '
+                f"{http_uri}/api/status"
+            )
+            _info("   If curl also 401s, ask beamline staff for a valid key.")
+        elif "ssl" in msg or "certificate" in msg:
+            _info("-> TLS error: httpserver cert expired or self-signed.")
+            _info(
+                "   Try the local HTTP frontend instead:\n"
+                "     export XPD_HTTP_SERVER_URI=http://localhost:60610"
+            )
+        else:
+            _info("-> Connection error: is start-re-manager + httpserver running?")
+            _info("   Start with:")
+            _info("     start-re-manager --startup-module <module> &")
+            _info("     uvicorn --host localhost --port 60610 bluesky_httpserver.server:app &")
         return 1
 
-    cfg  = cfg_out[0]
-    conn = cfg["connection"]
-    http_key = os.environ["XPD_HTTP_API_KEY"]
+    _ok("authenticated — /status returned")
+    _info(f"manager_state         = {status.get('manager_state')}")
+    _info(f"worker_environment_up = {status.get('worker_environment_exists')}")
+    _info(f"re_state              = {status.get('re_state')}")
+    _info(f"items_in_queue        = {status.get('items_in_queue')}")
 
-    # Stage 2
-    if stage2_qserver(conn, http_key, api_out):
+    env_up = bool(status.get("worker_environment_exists"))
+    if not env_up:
+        _warn(
+            "Worker environment NOT open — plan list in Stage 7 will be empty.\n"
+            "       Open it:  api.environment_open()  or  qserver environment open"
+        )
+
+    # -----------------------------------------------------------------------
+    _stage(3, "Tiled raw + sandbox clients resolve")
+    # -----------------------------------------------------------------------
+    raw_client = sandbox_client = None
+    try:
+        from tiled.client import from_profile, from_uri
+
+        raw_client = from_uri(raw_uri) if raw_uri else from_profile(raw_prof)
+        _ok(f"raw client resolved: {type(raw_client).__name__}")
+
+        sandbox_root = from_uri(sbx_uri)
+        sandbox_client = sandbox_root[_SANDBOX_CATALOG]
+        _ok(f"sandbox client resolved: {_SANDBOX_CATALOG}")
+    except Exception as exc:
+        _bad(f"Tiled resolve failed: {exc}")
+        msg = str(exc).lower()
+        if "401" in msg or "unauthorized" in msg:
+            _info("-> Tiled 401: profile token missing or expired.")
+            _info("   Check ~/.config/tiled/profiles/*.yml")
+        elif "profile" in msg:
+            _info(f"-> profile '{raw_prof}' not found in ~/.config/tiled/profiles/")
+        # Non-fatal for auth check; evaluator needs it. Continue to next stage.
+        _info("(Tiled needed for evaluation — fix before running a campaign)")
+
+    # -----------------------------------------------------------------------
+    _stage(4, "XrayUvvisEvaluation constructs")
+    # -----------------------------------------------------------------------
+    if not pdf_ref:
+        _warn(
+            "XPD_PDF_REFERENCES not set — skipping evaluator + agent build (Stages 4-6).\n"
+            "       Set it to run the full check:\n"
+            "         export XPD_PDF_REFERENCES=/path/pdf_references.json"
+        )
+        # Skip to plan registration check — still useful for the auth/worker goal.
+        return _stage7_plans(api, env_up)
+
+    try:
+        from xpd_tools.optimization.evaluation import XrayUvvisEvaluation
+
+        evaluation = XrayUvvisEvaluation(
+            raw_client,
+            sandbox_client,
+            pdf_ref,
+            pdf_mode=pdf_mode,
+        )
+        _ok(f"evaluator built — phases: {[p.name for p in evaluation.phases]}")
+        _info(f"peak_target = {evaluation.peak_target}  |  pdf_mode = {evaluation.pdf_mode}")
+    except Exception as exc:
+        _bad(f"XrayUvvisEvaluation failed: {exc}")
+        _info(
+            "pdf_references JSON format:\n"
+            '  {"schema_version": 1, "phases": [\n'
+            '    {"name": "CsPbBr3", "gr_path": "...", "minimize": false, "cif_path": "..."}\n'
+            "  ]}"
+        )
+        _info("pdf_mode='fit' requires cif_path on every phase.")
+        traceback.print_exc()
         return 1
 
-    # Stage 3 (non-fatal)
-    stage3_tiled(conn)
+    # -----------------------------------------------------------------------
+    _stage(5, "RemoteDispatcher(zmq) constructs")
+    # -----------------------------------------------------------------------
+    try:
+        from bluesky.callbacks.zmq import RemoteDispatcher
 
-    # Stage 4
-    if stage4_build(cfg, http_key, run_agent_out):
+        dispatcher = RemoteDispatcher(zmq_addr)
+        _ok(f"RemoteDispatcher built: {zmq_addr}")
+    except Exception as exc:
+        _bad(f"RemoteDispatcher failed: {exc}")
+        _info(f"ZMQ address: {zmq_addr}")
+        _info("Is the ZMQ proxy running and the socket accessible?")
+        traceback.print_exc()
         return 1
 
-    # Stage 5
-    if stage5_plans(run_agent_out[0]):
+    # -----------------------------------------------------------------------
+    _stage(6, "build_queue_agent() constructs")
+    # -----------------------------------------------------------------------
+    try:
+        from xpd_tools.optimization.agent import build_queue_agent
+
+        agent = build_queue_agent(evaluation, api, dispatcher)
+        _ok("QueueserverAgent constructed")
+        _info(f"dofs       = {[d.name for d in agent.dofs]}")
+        _info(f"objectives = {[o.name for o in agent.objectives]}")
+    except Exception as exc:
+        _bad(f"build_queue_agent failed: {exc}")
+        traceback.print_exc()
         return 1
 
+    # -----------------------------------------------------------------------
+    return _stage7_plans(api, env_up)
+
+
+def _stage7_plans(api, env_up: bool) -> int:
+    _stage(7, f"'{_TARGET_PLAN}' registered on worker")
+
+    try:
+        resp = api.plans_allowed(user_group="admin")
+        plans = sorted(resp.get("plans_allowed", {}).keys())
+    except Exception as exc:
+        _bad(f"plans_allowed() failed: {exc}")
+        traceback.print_exc()
+        return 1
+
+    if plans:
+        print("  Registered plans:")
+        for p in plans:
+            marker = f"  {chr(8592)}" if p == _TARGET_PLAN else ""
+            print(f"    {p}{marker}")
+    else:
+        _warn("Plan list is empty.")
+        if not env_up:
+            _info("Worker env is closed — open it and re-run to see plans.")
+        else:
+            _info(
+                "Worker env is open but no plans found.\n"
+                "       Check the RE manager startup module injects 'xray_uvvis_acquire'.\n"
+                "       Also check user_group_permissions.yaml allows the plan."
+            )
+        return 1
+
+    if _TARGET_PLAN not in plans:
+        _bad(f"'{_TARGET_PLAN}' NOT registered on the worker.")
+        _info("The RE manager startup module must inject it into the worker namespace.")
+        _info("Check user_group_permissions.yaml includes:")
+        _info('  allowed_plans:\n    - ":xray_uvvis_acquire"')
+        return 1
+
+    _ok(f"'{_TARGET_PLAN}' registered and ready.")
     print(f"\n{'='*64}")
-    print(f"{GREEN}ALL STAGES PASSED — queue-server path ready.{RESET}")
+    print(f"\033[32mALL STAGES PASSED — blop-agent queue path ready.\033[0m")
     print(f"{'='*64}\n")
     return 0
 
