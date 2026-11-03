@@ -7,25 +7,29 @@ flow path is clear before running.
 
 How it works
 ------------
-Uploads a self-executing script into the RE worker namespace via
-``script_upload``.  The script drives ultra1 directly using the ophyd
-device already connected there — no queue, no RunEngine, no plan
-registration.
+Uploads a self-executing script into the RE worker namespace via a single
+``script_upload`` call.  No status checks, no polling — only write:scripts
+scope is required.
 
-Scope footprint (only write:scripts + read:status required):
-    status()          read:status
-    script_upload()   write:scripts
-    task_result()     read:status
+The uploaded script drives ultra1 directly using the ophyd device already
+connected in the worker (halide.py exposes ``ultra1`` as a module global).
+A try/finally guarantees pump_stop fires even if an earlier put raises.
 
-The worker environment must already be open (the script will tell you
-if it isn't).
+After uploading the client runs a local countdown so you know when to
+expect the pump to stop.  Verify flow physically / at the controller.
+
+Requirements
+------------
+- Worker environment must already be open.
+- Worker must be idle (no plan running).
+- API key needs: write:scripts  (only)
 
 Usage::
 
     export XPD_HTTP_API_KEY=<queue-server key>
     python test_beamline_pump.py
 
-Optional overrides (defaults from halide wiring):
+Optional overrides:
     XPD_HTTP_SERVER_URI   default: https://xf28id2-xpd-qs1.nsls2.bnl.gov
     PUMP_RATE_UL_MIN      default: 10.0
     PUMP_DURATION_SEC     default: 120.0
@@ -48,34 +52,21 @@ HTTP_KEY     = os.environ.get("XPD_HTTP_API_KEY", "")
 RATE_UL_MIN  = float(os.environ.get("PUMP_RATE_UL_MIN", "10.0"))
 DURATION_SEC = float(os.environ.get("PUMP_DURATION_SEC", "120.0"))
 
-TASK_TIMEOUT  = DURATION_SEC + 30.0  # generous: pump run + settle
-POLL_INTERVAL = 2.0
-
 # ---------------------------------------------------------------------------
 # Script executed inside the RE worker process.
-#
-# `ultra1` is already in the worker namespace — halide.py exposes it as a
-# module-level name from build_halide_devices().
-#
-# Direct .put() bypasses set_infuse2() rate-table validation, which rejects
-# 10 µL/min for the large steel syringe.  The controller itself decides
-# whether to accept the rate.
-#
-# The try/finally guarantees pump_stop fires even if an earlier put raises.
+# ultra1 is already in the worker namespace (halide.py module global).
+# Direct .put() bypasses set_infuse2() rate-table validation.
 # ---------------------------------------------------------------------------
 
 _WORKER_SCRIPT = textwrap.dedent(f"""\
     import time
 
-    _rate     = {RATE_UL_MIN}
-    _duration = {DURATION_SEC}
-
     try:
         ultra1.infuse_rate_unit.put("ul/min", wait=True)
-        ultra1.infuse_rate.put(_rate, wait=True)
+        ultra1.infuse_rate.put({RATE_UL_MIN}, wait=True)
         time.sleep(1.0)
         ultra1.pump_infuse.put(1, wait=True)
-        time.sleep(_duration)
+        time.sleep({DURATION_SEC})
     finally:
         ultra1.pump_stop.put(1, wait=True)
 """)
@@ -106,7 +97,7 @@ def main() -> int:
 
     if not HTTP_KEY:
         _bad(
-            "XPD_HTTP_API_KEY is empty — queue server will reject with 401.\n"
+            "XPD_HTTP_API_KEY is empty.\n"
             "       export XPD_HTTP_API_KEY=<key>"
         )
         return 1
@@ -120,131 +111,62 @@ def main() -> int:
     api = REManagerAPI(http_server_uri=HTTP_URI)
     api.set_authorization_key(api_key=HTTP_KEY)
 
-    # -- Auth / status check ------------------------------------------------
-    print("\nChecking queue-server status...")
-    try:
-        status = api.status()
-    except Exception as exc:
-        _bad(f"status() failed: {exc}")
-        msg = str(exc).lower()
-        if "401" in msg or "unauthorized" in msg:
-            _info("-> 401: key missing or invalid.")
-            _info(f'   curl -s -H "Authorization: ApiKey $XPD_HTTP_API_KEY" {HTTP_URI}/api/status')
-        return 1
-
-    _ok("connected")
-    _info(f"manager_state = {status.get('manager_state')}")
-    _info(f"env_exists    = {status.get('worker_environment_exists')}")
-    _info(f"re_state      = {status.get('re_state')}")
-
-    if not status.get("worker_environment_exists"):
-        _bad(
-            "Worker environment is not open.\n"
-            "       Someone with write:manager:control must run:\n"
-            "         qserver environment open\n"
-            "       then re-run this script."
-        )
-        return 1
-
-    manager_state = status.get("manager_state", "")
-    if manager_state != "idle":
-        _bad(
-            f"Manager is not idle (state={manager_state!r}).\n"
-            "       script_upload is refused while a plan is running.\n"
-            "       Wait for the current run to finish, then retry."
-        )
-        return 1
-
-    _ok("worker env open and idle — ready to upload")
-
-    # -- Upload and execute the pump script ---------------------------------
-    print(f"\nUploading pump script ({DURATION_SEC:.0f} s run)...")
-    print("  Script to execute in worker:")
+    # -- Upload (the only API call) ----------------------------------------
+    print("\nScript to execute in worker:")
     for line in _WORKER_SCRIPT.splitlines():
         print(f"    {line}")
     print()
+    print("Uploading...")
 
     try:
         resp = api.script_upload(_WORKER_SCRIPT, update_lists=False)
-        task_uid = resp.get("task_uid")
-        if not task_uid:
-            _bad(f"script_upload returned no task_uid: {resp}")
-            return 1
-        _ok(f"uploaded — task_uid: {task_uid}")
     except Exception as exc:
         _bad(f"script_upload() failed: {exc}")
         msg = str(exc).lower()
         if "401" in msg or "unauthorized" in msg:
-            _info("-> 401: key lacks write:scripts scope.")
+            _info("-> 401: key lacks write:scripts scope, or key is invalid.")
+        elif "409" in msg or "conflict" in msg:
+            _info("-> 409: worker is busy (plan running) or env is closed.")
+            _info("   Wait for the current run to finish and retry.")
         traceback.print_exc()
         return 1
 
-    # -- Poll task_result until done ----------------------------------------
-    print(
-        f"\nPump running in worker process for {DURATION_SEC:.0f} s.\n"
-        "Polling task status every 2 s  (script will stop pump on completion).\n"
-    )
+    task_uid = resp.get("task_uid", "(none)")
+    _ok(f"uploaded — task_uid: {task_uid}")
+    _info("Pump is now running in the worker process.")
+    _info("Verify flow physically / at the controller.")
+
+    # -- Local countdown (informational only) ------------------------------
+    print(f"\nLocal countdown for {DURATION_SEC:.0f} s  (Ctrl-C to exit this script)\n")
     start = time.monotonic()
-    result = None
     try:
         while True:
-            elapsed = time.monotonic() - start
+            elapsed   = time.monotonic() - start
             remaining = DURATION_SEC - elapsed
-
+            if remaining <= 0:
+                break
             print(
-                f"\r  t={elapsed:5.0f}s  remaining≈{max(remaining, 0):5.0f}s",
+                f"\r  elapsed: {elapsed:5.0f} s  |  remaining: {remaining:5.0f} s",
                 end="",
                 flush=True,
             )
-
-            try:
-                resp = api.task_result(task_uid=task_uid)
-                task_status = resp.get("status", "")
-                if task_status == "completed":
-                    result = resp.get("result", {})
-                    break
-            except Exception as exc:
-                _warn(f"\npoll failed: {exc}")
-
-            if elapsed > TASK_TIMEOUT:
-                _warn(f"\ntask_result timed out after {elapsed:.0f} s")
-                break
-
-            time.sleep(POLL_INTERVAL)
-
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print(f"\n\n{Y}Interrupted.{X}")
+        print(f"\n\n{Y}Local countdown interrupted.{X}")
         _warn(
-            "The script is running inside the worker — it cannot be cancelled\n"
-            "       remotely without write:manager:control scope.\n"
-            "       The pump will stop automatically when the script finishes\n"
-            f"       (at most {TASK_TIMEOUT:.0f} s from upload).\n"
+            "The script is still running inside the worker.\n"
+            "       The pump will stop automatically when the worker script finishes\n"
+            f"       (within {DURATION_SEC:.0f} s of upload).\n"
             "       To stop immediately: use the pump controller directly."
         )
-        return 1
+        return 0
 
     print()
-    elapsed = time.monotonic() - start
-
-    # -- Interpret result ---------------------------------------------------
-    if result is None:
-        _warn("No result received — pump may still be running or task timed out")
-        return 1
-
-    success = result.get("success", False)
-    msg     = result.get("msg", "")
-
-    if success:
-        _ok(f"Script completed successfully in {elapsed:.0f} s")
-    else:
-        _bad(f"Script failed: {msg}")
-        tb = result.get("traceback", "")
-        if tb:
-            print(tb)
-        return 1
+    _ok(f"Countdown complete — pump should have stopped ({DURATION_SEC:.0f} s elapsed).")
+    _info("Check the controller to confirm.")
 
     print(f"\n{'='*56}")
-    print(f"{G}Done.{X}  ultra1 stopped after {elapsed:.0f} s.")
+    print(f"{G}Done.{X}")
     print(f"{'='*56}\n")
     return 0
 
