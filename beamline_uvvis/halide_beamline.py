@@ -83,7 +83,6 @@ else:
     from xpd_tools.optimization.helpers.dofs import Pump  # noqa: E402
     from xpd_tools.optimization.helpers.qepro import (  # noqa: E402
         PlqyReference,
-        QualityPolicy,
         SpectraFitSettings,
     )
     from xpd_tools.optimization.plans import DilutionStage, FlowSource, WashCycle  # noqa: E402
@@ -119,6 +118,13 @@ else:
         max_fwhm_nm=60,
         max_retries=10,
         retry_delay=2.0,
+        # PL quality gate: collect good_target consecutive "good" batches
+        # before accepting a measurement; abort after max_bad consecutive failures.
+        use_good_bad=True,
+        good_target=3,
+        max_bad=3,
+        num_abs=10,
+        num_flu=10,
         fit_settings=SpectraFitSettings(
             pl_screen_key_height=200,
             pl_screen_peak_height=50,
@@ -209,20 +215,12 @@ else:
         wash_cycles=[
             WashCycle(pump="ultra1", loaded_ml=30.0),
         ],
-        # Flow geometry — explicit so the values are visible here and
-        # propagated into flow_config when build() submits to queueserver.
+        # Flow geometry — baked into the plan closure at worker startup via
+        # register_acquisition_plans(); build() sends no config kwargs per trial.
         rate_unit="ul/min",
         mixer_lengths_cm=(30.0,),
         residence_time_ratio=1.0,
-    )
-
-    # -- Quality policy ---------------------------------------------------
-    build_agent.quality_policy = QualityPolicy(
-        enabled=True,
-        good_batches=3,
-        max_bad_batches=3,
-        absorbance_shots=10,
-        fluorescence_shots=10,
+        tubing_id_mm=1.016,   # 1/25" ID PEEK tubing standard at the beamline
     )
 
     # -- Run settings -----------------------------------------------------

@@ -66,9 +66,10 @@ build_agent = load_campaign_config(CONFIG_PATH)
 print("\nBuildAgent reconstructed:")
 print(f"  evaluation_method : {build_agent.evaluation_method}")
 print(f"  DOFs              : {[p.id for p in build_agent.pumps]}")
-print(f"  rate_unit         : {build_agent.rate_unit}")
-print(f"  mixer_lengths_cm  : {build_agent.mixer_lengths_cm}")
+print(f"  rate_unit           : {build_agent.rate_unit}")
+print(f"  mixer_lengths_cm    : {build_agent.mixer_lengths_cm}")
 print(f"  residence_time_ratio: {build_agent.residence_time_ratio}")
+print(f"  tubing_id_mm        : {build_agent.tubing_id_mm}")
 
 # ---------------------------------------------------------------------------
 # Build agent and verify plan registration
